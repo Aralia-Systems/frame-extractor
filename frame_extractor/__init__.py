@@ -1,1 +1,1 @@
-from frame_extractor import FrameExtractor
+from .frame_extractor import FrameExtractor
