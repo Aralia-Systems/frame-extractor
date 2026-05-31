@@ -2,259 +2,355 @@ import cv2
 import os
 import subprocess
 import time
+import logging
 import numpy as np
 from scipy.signal import argrelextrema
+from typing import Tuple, List
+
+# Configure logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# Create console handler with DEBUG level
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+
+# Magic number constants
+FRAME_INDEX_MASK = [-3, 0, 3, 6, 9, 12]
+ARGRELEXTREMA_ORDER = 12
+MAX_IMAGES_LIMIT = 100
+REFERENCE_FRAME_OFFSET = 2
+FRAME_NAME_PREFIX = "frame_"
+FRAME_FILE_EXTENSION = ".png"
 
 class FrameExtractor:
     """
     A class for processing frames from a video using FFmpeg and OpenCV.
 
     Args:
-        input_video_path (str): The path to the input video file.
-        output_folder (str, optional): The folder where processed frames will be saved. Default is './output_frames'.
+        input_video_filepath (str): The path to the input video file.
 
     Attributes:
         input_video_path (str): The path to the input video file.
-        output_folder (str): The folder where processed frames will be saved.
-        image_index_list (list): A list to store image indices used for further processing.
+        image_folder_path (str): The folder where extracted frames will be saved.
+        image_index_list (list): A list of frame indices selected for further processing.
+        filenames (list): List of all extracted frame filenames.
+        mean_intensity (list): Mean intensity values for each frame.
 
     Methods:
-        process_frames(output_height=1920, output_width=1080):
-            Process frames from the input video and save them as PNG images in the output folder.
-            Optionally, specify the output image dimensions (height and width).
+        process_frames() -> Tuple[float, float]:
+            Process frames from the input video and save them as PNG images.
+            Returns extraction time and identification time in seconds.
 
-        Note: After processing frames, you can access the `image_index_list` attribute to retrieve image indices
-        used for further processing.
+        get_image_index_list() -> List[int]:
+            Get the list of frame indices selected for processing.
+
+        get_filenames_to_process() -> List[str]:
+            Get filenames that should be processed based on selected indices.
+
+        get_filenames_to_delete() -> List[str]:
+            Get filenames that should be deleted (not in selected indices).
 
     Example:
-        processor = FrameProcessor('input_video.mp4', output_folder='./output_frames')
-        extract_time, identify_time = processor.process_frames(output_height=720, output_width=1280)
+        processor = FrameExtractor('input_video.mp4')
+        extract_time, identify_time = processor.process_frames()
         print(f"Extraction time: {extract_time} seconds")
         print(f"Identification time: {identify_time} seconds")
-        print(f"Image indices for further processing: {processor.image_index_list}")
-
+        filenames = processor.get_filenames_to_process()
     """
 
-    def __init__(self, input_video_filepath):
+    def __init__(self, input_video_filepath: str) -> None:
+        logger.info(f"Initializing FrameExtractor with video: {input_video_filepath}")
         self.input_video_path = input_video_filepath
         self.image_folder_path = os.path.dirname(input_video_filepath)
         self.image_index_list = []
-        self.width = None
-        self.height = None
         self.filenames = []
         self.mean_intensity = []
+        logger.debug(f"Output folder path set to: {self.image_folder_path}")
 
-    def process_frames(self, output_height=1920, output_width=1080):
+    def process_frames(self) -> Tuple[float, float]:
         """
         Process frames from the input video and save them as PNG images.
 
-        Args:
-            output_height (int, optional): The height of the output images. Default is 1920 pixels.
-            output_width (int, optional): The width of the output images. Default is 1080 pixels.
-
         Returns:
-            float: The time taken for frame extraction in seconds.
-            float: The time taken for frame identification in seconds.
+            Tuple[float, float]: (extraction_time, identification_time) in seconds.
+
+        Raises:
+            Exception: If FFmpeg extraction fails or if frame identification fails.
 
         Note:
-            After processing frames, you can access the `image_index_list` attribute to retrieve image indices
-            used for further processing.
+            After processing frames, access `image_index_list` attribute to retrieve selected frame indices.
+            Use get_filenames_to_process() to get the specific filenames to process.
         """
-        # identify algorithm runs faster with small images
-        # scale_npp=60:-1 will output a 60px width image and maintain height aspect
-
-        # Not needed?
-
-        # cap = cv2.VideoCapture(self.input_video_path)
-
-        # if not cap.isOpened():
-        #     raise Exception("could not open video file")
-        # else:
-        #     self.width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        #     self.height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        #     print(f'height: {self.height}')
-        #     print(f'width: {self.width}')
-
-        # cap.release()
-
-        # http://underpop.online.fr/f/ffmpeg/help/scale_005fnpp.htm.gz
-        # interp_algo
-        # - super
-        # - lanczos
-
+        logger.info(f"Starting frame processing for video: {self.input_video_path}")
+        
+        # Construct FFmpeg command for frame extraction using hardware acceleration
+        output_pattern = os.path.join(self.image_folder_path, f'{FRAME_NAME_PREFIX}%04d{FRAME_FILE_EXTENSION}')
         ffmpeg_cmd = [
             'ffmpeg',
             '-hwaccel', 'nvdec',
             '-i', self.input_video_path,
             '-vsync', '0',
-            os.path.join(self.image_folder_path, 'frame_%04d.png')]        
+            output_pattern
+        ]
+        logger.debug(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
 
-
-        # ffmpeg_cmd = [
-        #     'ffmpeg',
-        #     '-hwaccel', 'nvdec',
-        #     '-hwaccel_device', '0',
-        #     '-hwaccel_output_format', 'cuda',
-        #     '-noautorotate',
-        #     '-i', self.input_video_path,
-        #     '-r', '30',
-        #     '-map', '0:0',
-        #     '-map', '0:1?',
-        #     '-vf', f'scale_npp={self.height}:{self.width}:interp_algo=lanczos,hwdownload,format=nv12,transpose=1',
-        #     '-c:v:0', 'png',
-        #     '-f', 'image2',
-        #     os.path.join(self.image_folder_path, 'frame_%04d.png')
-        # ]
-
-        # Measure the time it takes to run the subprocess
+        # Run FFmpeg extraction
+        logger.info("Starting FFmpeg frame extraction...")
         start_time_extract = time.time()
-        process = subprocess.Popen(ffmpeg_cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-        stdout, stderr = process.communicate()
-        print(stdout)
-        print(stderr)
-        exit_code = process.wait()    
-        if exit_code != 0:
-            raise Exception(f'process failed')
+        try:
+            process = subprocess.Popen(ffmpeg_cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            stdout, stderr = process.communicate()
+            exit_code = process.returncode
+            
+            if stdout:
+                logger.debug(f"FFmpeg stdout: {stdout}")
+            if stderr:
+                logger.debug(f"FFmpeg stderr: {stderr}")
+                
+            if exit_code != 0:
+                logger.error(f"FFmpeg extraction failed with exit code {exit_code}")
+                logger.error(f"Error details: {stderr}")
+                raise Exception(f"FFmpeg frame extraction failed with exit code {exit_code}. Details: {stderr}")
+            
+            logger.info("FFmpeg frame extraction completed successfully")
+        except Exception as e:
+            logger.exception(f"Exception during FFmpeg extraction: {e}")
+            raise
         end_time_extract = time.time()
 
-        # Initialize variables
+        # Initialize variables for frame analysis
         difference = []
         frame_n1 = None
-        # some area for improvement here if the first cycle is ignored
-        # could start identification later in the frame sequence
         start_range = 0
         num_of_images = 0
     
-        # Measure the time it takes to process the images
+        logger.info("Starting frame identification and analysis...")
         start_time_identify = time.time()
-
-        # print(sorted(os.listdir(self.image_folder_path)))
         
-        # Iterate through the images in the folder
-        # issue with using index because there are other files in the folder
-        # temporarily disabled stuff using idx
-        for idx, filename in enumerate(sorted(os.listdir(self.image_folder_path))):
-            if idx > 100:
-                raise Exception("too many images something went wrong with frame extraction")
-            if filename.endswith('.png') and filename.startswith("frame_"):
-                image_path = os.path.join(self.image_folder_path, filename)
+        # Get all frame files sorted by name
+        all_files = sorted(os.listdir(self.image_folder_path))
+        frame_files = [f for f in all_files if f.endswith(FRAME_FILE_EXTENSION) and f.startswith(FRAME_NAME_PREFIX)]
+        logger.info(f"Found {len(frame_files)} frame files to process")
+        
+        if len(frame_files) > MAX_IMAGES_LIMIT:
+            logger.error(f"Too many frames found ({len(frame_files)}) - FFmpeg extraction may have failed")
+            raise Exception(f"Frame extraction produced too many frames ({len(frame_files)} > {MAX_IMAGES_LIMIT}). Something went wrong.")
+        
+        # Iterate through extracted frames to analyze intensity changes
+        for idx, filename in enumerate(frame_files):
+            image_path = os.path.join(self.image_folder_path, filename)
+            logger.debug(f"Processing frame {idx + 1}/{len(frame_files)}: {filename}")
+            
+            try:
                 frame = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-                # we could skip the first x may give slight speed increase
+                if frame is None:
+                    logger.warning(f"Failed to read frame: {filename}")
+                    continue
+                    
                 if frame_n1 is not None:
-                    self.mean_intensity.append(np.mean(frame))
-                    diff = np.mean(abs(frame_n1 - frame))
+                    mean_val = np.mean(frame)
+                    self.mean_intensity.append(mean_val)
+                    diff = np.mean(abs(frame_n1.astype(float) - frame.astype(float)))
                     difference.append(diff)
+                    logger.debug(f"Frame {filename}: mean_intensity={mean_val:.2f}, diff_from_prev={diff:.2f}")
                 else:
                     self.mean_intensity.append(0)
+                    logger.debug(f"First frame {filename}: skipping difference calculation")
 
                 frame_n1 = frame
                 num_of_images += 1
-
-                self.filenames.append(filename)  # Store filenames
-            else:
+                self.filenames.append(filename)
+            except Exception as e:
+                logger.warning(f"Error processing frame {filename}: {e}")
                 continue
-
-            print(num_of_images)
+        
+        logger.info(f"Frame identification complete: processed {num_of_images} frames")
 
         process_range = (start_range, num_of_images)
+        logger.info(f"Process range: {process_range}")
 
-        # Calculate rolled_mean and maximal_diff2
+        # Calculate local maxima in intensity differences using rolling mean
+        logger.debug("Calculating intensity differences with rolling mean...")
         rolled_mean = np.roll(self.mean_intensity, 2)
         diff_2 = self.mean_intensity - rolled_mean
-        maximal_diff2 = np.asarray(argrelextrema(diff_2, np.greater, order=12))
+        logger.debug(f"Rolled mean differences: {diff_2}")
+        
+        # Find local maxima in the difference signal
+        maximal_diff2 = np.asarray(argrelextrema(diff_2, np.greater, order=ARGRELEXTREMA_ORDER))
         maximal_diff2 = np.concatenate(maximal_diff2)
-        sorted_diffs = maximal_diff2[np.argsort(-1 * diff_2[maximal_diff2])]
-        print(maximal_diff2)
+        logger.info(f"Found {len(maximal_diff2)} local maxima at indices: {maximal_diff2}")
+        logger.debug(f"Intensity differences at maxima: {diff_2[maximal_diff2] if len(maximal_diff2) > 0 else 'N/A'}")
 
-        # Measure the time it takes to process the images
         end_time_identify = time.time()
 
-        # no longer using argsort for the diffs
-        # there are typically 5 cycles in the 2 second video
-        # EV converges at the second cycle so best sequence to extract is the second or third
-        if len(maximal_diff2) >= 2:
-            current_value = maximal_diff2[2]
-        # if this is the last sequence it's possible the indexs may be invalid
-        elif len(maximal_diff2 == 1):
+        # Select reference frame based on detected cycles
+        # Typically there are 5 cycles in a 2-second video; EV converges at the second cycle
+        logger.info(f"Selecting reference frame from {len(maximal_diff2)} detected cycles...")
+        if len(maximal_diff2) >= REFERENCE_FRAME_OFFSET:
+            current_value = maximal_diff2[REFERENCE_FRAME_OFFSET]
+            logger.info(f"Selected frame index {current_value} as reference (cycle {REFERENCE_FRAME_OFFSET})")
+        elif len(maximal_diff2) == 1:
             current_value = maximal_diff2[0]
+            logger.warning(f"Only 1 cycle detected; using frame index {current_value} as reference")
         else:
-            raise Exception("failed to find sequence start frame")
+            logger.error(f"Failed to find suitable reference frame: only {len(maximal_diff2)} cycle(s) detected")
+            raise Exception(f"Failed to find reference frame: insufficient cycles detected ({len(maximal_diff2)}). Expected at least {REFERENCE_FRAME_OFFSET}.")
 
-        # Calculate and print the times
+        # Calculate processing times
         extract_time = end_time_extract - start_time_extract
         identify_time = end_time_identify - start_time_identify
+        logger.info(f"Processing times - Extraction: {extract_time:.2f}s, Identification: {identify_time:.2f}s")
 
+        # Get frame indices within valid range around reference frame
         self.image_index_list = self._check_indices_in_range(current_value, process_range)
+        logger.info(f"Selected frame indices: {self.image_index_list}")
 
+        # Detect and handle sync errors
         self.detect_sync_errors_and_shift_frame_indices()
         
+        logger.info(f"Frame processing complete. Returning extraction_time={extract_time:.2f}s, identify_time={identify_time:.2f}s")
         return extract_time, identify_time
     
-    # calculating image range could be improved 
-    def _check_indices_in_range(self, reference_frame, image_range):
-        index_mask_list = [-3, 0, 3, 6, 9, 12]
-        # index_mask_list = [-4, 0, 4, 8, 12, 16]
-        masked_list = [x + reference_frame for x in index_mask_list]
+    def _check_indices_in_range(self, reference_frame: int, image_range: Tuple[int, int]) -> List[int]:
+        """
+        Calculate frame indices around a reference frame using a predefined mask.
+        
+        Args:
+            reference_frame (int): The reference frame index.
+            image_range (Tuple[int, int]): Valid range (min, max) for frame indices.
+            
+        Returns:
+            List[int]: List of frame indices to process.
+            
+        Raises:
+            Exception: If any calculated index falls outside the valid range.
+        """
+        logger.debug(f"Calculating indices around reference frame {reference_frame} with range {image_range}")
+        masked_list = [x + reference_frame for x in FRAME_INDEX_MASK]
+        logger.debug(f"Masked indices: {masked_list}")
+        
         all_in_range = all(start_idx >= image_range[0] and start_idx <= image_range[1] for start_idx in masked_list)
 
         if all_in_range:
+            logger.info(f"All indices within valid range {image_range}: {masked_list}")
             return masked_list
         else:
-            raise Exception("image index out of bounds")
+            out_of_range = [idx for idx in masked_list if idx < image_range[0] or idx > image_range[1]]
+            logger.error(f"Frame indices out of bounds. Invalid indices: {out_of_range}, valid range: {image_range}")
+            raise Exception(f"Frame indices out of bounds: {out_of_range} not in range {image_range}")
 
-    # adding a getter so calling code is explicit
+    def detect_sync_errors_and_shift_frame_indices(self) -> None:
+        """
+        Detect potential frame synchronization errors by analyzing mean differences between selected frames.
+        Logs warning if anomalies are detected.
+        """
+        logger.debug("Checking for frame synchronization errors...")
+        try:
+            min_index = min(self.image_index_list)
+            max_index = self.image_index_list[REFERENCE_FRAME_OFFSET]
+            sequence_to_process = [self.filenames[x] for x in range(min_index, max_index + 1)]
+            logger.debug(f"Sync check sequence indices: {min_index} to {max_index}, files: {sequence_to_process}")
+            
+            img_n1 = None
+            mean_diff_list = []
+            
+            for i, image in enumerate(sequence_to_process):
+                image_path = os.path.join(self.image_folder_path, image)
+                try:
+                    img = cv2.imread(image_path)
+                    if img is None:
+                        logger.warning(f"Failed to read image for sync check: {image}")
+                        continue
+                        
+                    if img_n1 is not None:
+                        mean_diff = np.mean(img.astype(float) - img_n1.astype(float))
+                        mean_diff_list.append(mean_diff)
+                        logger.debug(f"Sync frame {i}: {image} - mean_diff={mean_diff:.2f}")
+                    img_n1 = img
+                except Exception as e:
+                    logger.warning(f"Error processing sync frame {image}: {e}")
+                    continue
 
-    def detect_sync_errors_and_shift_frame_indices(self):
-        min_index = min(self.image_index_list)
-        max_index = self.image_index_list[2]
-        sequence_to_process = [self.filenames[x] for x in range(min_index, max_index)]
-        # filename = filenames_to_process[1]
-        # abs_path = os.path.join(self.image_folder_path, filename)
-        img_n1 = None
-        mean_diff_list = []
-        for i, image in enumerate(sequence_to_process):
-            if i == 0:
-                img_n1 = cv2.imread(os.path.join(self.image_folder_path, image))
-                continue
-            img = cv2.imread(os.path.join(self.image_folder_path, image))
-            mean_diff = np.mean((img - img_n1))
-            img_n1 = img
-            mean_diff_list.append(mean_diff)
+            logger.debug(f"Mean differences in sequence: {mean_diff_list}")
 
-        print(mean_diff_list)
-
-        # Check if index 1 is greater than index 0
-        if mean_diff_list[1] > mean_diff_list[0]:
-        # Count how many items from the right (excluding the first two) are less than the item at index 1
-            count_less_than_index_1 = sum(value < mean_diff_list[1] for value in mean_diff_list[2:])
-
-        # There should only be one such item
-            if count_less_than_index_1 > 1:
-                print("reindexing frames")
-                # self.image_index_list = [x + 1 for x in self.image_index_list]
+            # Analyze frame differences for sync anomalies
+            if len(mean_diff_list) >= 2:
+                if mean_diff_list[1] > mean_diff_list[0]:
+                    count_less_than_index_1 = sum(value < mean_diff_list[1] for value in mean_diff_list[2:])
+                    if count_less_than_index_1 > 1:
+                        logger.warning("Frame sync anomaly detected: may need reindexing")
+                        logger.debug(f"Anomaly details: index[1]={mean_diff_list[1]:.2f} > index[0]={mean_diff_list[0]:.2f}, "
+                                   f"count_less_than_index_1={count_less_than_index_1}")
+                    else:
+                        logger.info("Frame indices confirmed valid - no reindexing needed")
+                else:
+                    logger.warning("Possible frame sync issue detected: index[1] not greater than index[0]")
+                    logger.debug(f"Mean differences: index[0]={mean_diff_list[0]:.2f}, index[1]={mean_diff_list[1]:.2f}")
             else:
-                print("frame indexes unaltered")
-        else:
-            print("possible frame sync issue detected")
+                logger.debug(f"Insufficient data for sync check ({len(mean_diff_list)} differences)")
+        except Exception as e:
+            logger.warning(f"Error during sync error detection: {e}")
             
 
-    def get_image_index_list(self):
+    def get_image_index_list(self) -> List[int]:
+        """
+        Get the list of frame indices selected for processing.
+        
+        Returns:
+            List[int]: Frame indices to process.
+            
+        Raises:
+            Exception: If image_index_list is empty (process_frames must be called first).
+        """
+        logger.debug(f"Getting image index list: {self.image_index_list}")
         if not self.image_index_list:
-            raise Exception("image_index_list is None")
+            logger.error("Attempted to get image_index_list before process_frames() was called")
+            raise Exception("image_index_list is empty. Call process_frames() first.")
         return self.image_index_list
 
-    def get_filenames_to_process(self) -> list:
+    def get_filenames_to_process(self) -> List[str]:
+        """
+        Get filenames corresponding to selected frame indices.
+        
+        Returns:
+            List[str]: Filenames to process.
+            
+        Raises:
+            Exception: If process_frames has not been called yet.
+        """
+        logger.debug("Getting filenames to process")
         if not self.image_index_list:
-            raise Exception("image_index_list is None")
+            logger.error("Attempted to get filenames before process_frames() was called")
+            raise Exception("image_index_list is empty. Call process_frames() first.")
         if not self.filenames:
-            raise Exception("filenames is None")
+            logger.error("Filenames list is empty")
+            raise Exception("filenames list is empty. Call process_frames() first.")
         filenames_to_process = [self.filenames[x] for x in self.image_index_list]
+        logger.info(f"Returning {len(filenames_to_process)} filenames to process: {filenames_to_process}")
         return filenames_to_process
     
-    def get_filenames_to_delete(self) -> list:
+    def get_filenames_to_delete(self) -> List[str]:
+        """
+        Get filenames that should be deleted (not in selected indices).
+        
+        Returns:
+            List[str]: Filenames to delete.
+            
+        Raises:
+            Exception: If process_frames has not been called yet.
+        """
+        logger.debug("Getting filenames to delete")
         if not self.image_index_list:
-            raise Exception("image_index_list is None")
+            logger.error("Attempted to get filenames before process_frames() was called")
+            raise Exception("image_index_list is empty. Call process_frames() first.")
         if not self.filenames:
-            raise Exception("filenames is None")
+            logger.error("Filenames list is empty")
+            raise Exception("filenames list is empty. Call process_frames() first.")
         filenames_to_delete = [self.filenames[x] for x in range(len(self.filenames)) if x not in self.image_index_list]
+        logger.info(f"Returning {len(filenames_to_delete)} filenames to delete: {filenames_to_delete}")
         return filenames_to_delete
