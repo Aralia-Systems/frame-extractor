@@ -1,0 +1,12 @@
+# Ignore all video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.flv
+*.wmv
+*.webm
+
+# But keep this directory and its documentation
+!.gitkeep
+!README.md

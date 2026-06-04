@@ -6,6 +6,7 @@ import logging
 import numpy as np
 from scipy.signal import argrelextrema
 from typing import Tuple, List
+import matplotlib.pyplot as plt
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -33,6 +34,8 @@ class FrameExtractor:
 
     Args:
         input_video_filepath (str): The path to the input video file.
+        use_hw_acceleration (bool): Enable NVIDIA hardware acceleration (NVDEC).
+            Default: True. Set to False to use CPU-only processing.
 
     Attributes:
         input_video_path (str): The path to the input video file.
@@ -40,10 +43,12 @@ class FrameExtractor:
         image_index_list (list): A list of frame indices selected for further processing.
         filenames (list): List of all extracted frame filenames.
         mean_intensity (list): Mean intensity values for each frame.
+        use_hw_acceleration (bool): Whether hardware acceleration is enabled.
 
     Methods:
         process_frames() -> Tuple[float, float]:
             Process frames from the input video and save them as PNG images.
+            Also generates an intensity histogram for analysis.
             Returns extraction time and identification time in seconds.
 
         get_image_index_list() -> List[int]:
@@ -52,25 +57,51 @@ class FrameExtractor:
         get_filenames_to_process() -> List[str]:
             Get filenames that should be processed based on selected indices.
 
-        get_filenames_to_delete() -> List[str]:
-            Get filenames that should be deleted (not in selected indices).
+        cleanup() -> None:
+            Delete temporary frame files that were not selected for processing.
 
     Example:
-        processor = FrameExtractor('input_video.mp4')
-        extract_time, identify_time = processor.process_frames()
-        print(f"Extraction time: {extract_time} seconds")
-        print(f"Identification time: {identify_time} seconds")
-        filenames = processor.get_filenames_to_process()
+        Using context manager (recommended - automatic cleanup):
+            with FrameExtractor('input_video.mp4') as processor:
+                extract_time, identify_time = processor.process_frames()
+                # Automatically generates intensity_histogram.png
+                filenames = processor.get_filenames_to_process()
+                # Temporary files automatically deleted on exit
+        
+        Using CPU-only processing:
+            with FrameExtractor('input_video.mp4', use_hw_acceleration=False) as processor:
+                extract_time, identify_time = processor.process_frames()
+        
+        Manual usage:
+            processor = FrameExtractor('input_video.mp4')
+            extract_time, identify_time = processor.process_frames()
+            # intensity_histogram.png is created automatically
+            filenames = processor.get_filenames_to_process()
+            processor.cleanup()  # Manually delete temporary files
     """
 
-    def __init__(self, input_video_filepath: str) -> None:
+    def __init__(self, input_video_filepath: str, use_hw_acceleration: bool = True) -> None:
         logger.info(f"Initializing FrameExtractor with video: {input_video_filepath}")
         self.input_video_path = input_video_filepath
         self.image_folder_path = os.path.dirname(input_video_filepath)
         self.image_index_list = []
         self.filenames = []
         self.mean_intensity = []
+        self._processed = False
+        self.use_hw_acceleration = use_hw_acceleration
         logger.debug(f"Output folder path set to: {self.image_folder_path}")
+        logger.debug(f"Hardware acceleration: {'enabled' if use_hw_acceleration else 'disabled'}")
+
+    def __enter__(self):
+        """Enable context manager support for automatic resource cleanup."""
+        logger.debug("Entering FrameExtractor context")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Cleanup temporary frame files on context exit."""
+        logger.debug("Exiting FrameExtractor context")
+        self.cleanup()
+        return False
 
     def process_frames(self) -> Tuple[float, float]:
         """
@@ -88,15 +119,21 @@ class FrameExtractor:
         """
         logger.info(f"Starting frame processing for video: {self.input_video_path}")
         
-        # Construct FFmpeg command for frame extraction using hardware acceleration
+        # Construct FFmpeg command for frame extraction
         output_pattern = os.path.join(self.image_folder_path, f'{FRAME_NAME_PREFIX}%04d{FRAME_FILE_EXTENSION}')
-        ffmpeg_cmd = [
-            'ffmpeg',
-            '-hwaccel', 'nvdec',
+        
+        # Build command with optional hardware acceleration
+        ffmpeg_cmd = ['ffmpeg']
+        
+        if self.use_hw_acceleration:
+            ffmpeg_cmd.extend(['-hwaccel', 'nvdec'])
+        
+        ffmpeg_cmd.extend([
             '-i', self.input_video_path,
             '-vsync', '0',
             output_pattern
-        ]
+        ])
+        
         logger.debug(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
 
         # Run FFmpeg extraction
@@ -213,7 +250,12 @@ class FrameExtractor:
         # Detect and handle sync errors
         self.detect_sync_errors_and_shift_frame_indices()
         
+        self._processed = True
         logger.info(f"Frame processing complete. Returning extraction_time={extract_time:.2f}s, identify_time={identify_time:.2f}s")
+        
+        # Generate intensity histogram
+        self._plot_intensity_histogram()
+        
         return extract_time, identify_time
     
     def _check_indices_in_range(self, reference_frame: int, image_range: Tuple[int, int]) -> List[int]:
@@ -295,6 +337,102 @@ class FrameExtractor:
                 logger.debug(f"Insufficient data for sync check ({len(mean_diff_list)} differences)")
         except Exception as e:
             logger.warning(f"Error during sync error detection: {e}")
+
+    def _plot_intensity_histogram(self) -> None:
+        """
+        Generate and save a plot of mean intensity values across frames.
+        
+        Shows all extracted frames vs selected frames for comparison.
+        Saved as 'intensity_histogram.png' in the output directory.
+        X-axis: Frame number
+        Y-axis: Mean intensity value
+        """
+        if not self.mean_intensity or not self.image_index_list:
+            logger.debug("Skipping plot: insufficient data")
+            return
+        
+        try:
+            # Get intensity values for selected frames
+            selected_intensity = [self.mean_intensity[idx] for idx in self.image_index_list]
+            selected_frame_numbers = self.image_index_list
+            all_frame_numbers = list(range(len(self.mean_intensity)))
+            
+            # Create figure with subplots
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+            
+            # Plot 1: All frames
+            ax1.plot(all_frame_numbers, self.mean_intensity, 
+                    marker='o', linestyle='-', linewidth=1.5, markersize=4, 
+                    color='steelblue', label='Frame Intensity')
+            ax1.axhline(np.mean(self.mean_intensity), color='red', linestyle='--', 
+                       linewidth=2, label=f'Mean: {np.mean(self.mean_intensity):.2f}')
+            ax1.set_xlabel('Frame Number', fontsize=11)
+            ax1.set_ylabel('Mean Intensity', fontsize=11)
+            ax1.set_title('All Extracted Frames', fontsize=12, fontweight='bold')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            
+            # Plot 2: Selected frames only
+            ax2.plot(selected_frame_numbers, selected_intensity, 
+                    marker='o', linestyle='-', linewidth=1.5, markersize=6, 
+                    color='forestgreen', label='Selected Intensity')
+            ax2.axhline(np.mean(selected_intensity), color='red', linestyle='--', 
+                       linewidth=2, label=f'Mean: {np.mean(selected_intensity):.2f}')
+            ax2.set_xlabel('Frame Number', fontsize=11)
+            ax2.set_ylabel('Mean Intensity', fontsize=11)
+            ax2.set_title(f'Selected Frames (n={len(selected_intensity)})', fontsize=12, fontweight='bold')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            
+            # Overall title
+            fig.suptitle('Frame Intensity Analysis', fontsize=14, fontweight='bold', y=1.00)
+            fig.tight_layout()
+            
+            # Save plot
+            histogram_path = os.path.join(self.image_folder_path, 'intensity_histogram.png')
+            fig.savefig(histogram_path, dpi=100, bbox_inches='tight')
+            logger.info(f"Intensity plot saved: {histogram_path}")
+            
+            # Close figure to free memory
+            plt.close(fig)
+            
+        except Exception as e:
+            logger.warning(f"Error generating intensity plot: {e}")
+
+    def cleanup(self) -> None:
+        """
+        Delete temporary frame files that were not selected for processing.
+        
+        This method is automatically called when using FrameExtractor as a context manager.
+        Should be called manually if not using context manager pattern.
+        """
+        if not self._processed:
+            logger.debug("Cleanup called before processing; nothing to clean")
+            return
+        
+        try:
+            filenames_to_delete = [
+                self.filenames[x] for x in range(len(self.filenames)) 
+                if x not in self.image_index_list
+            ]
+            
+            if not filenames_to_delete:
+                logger.info("No files to delete; all frames were selected")
+                return
+            
+            logger.info(f"Cleaning up {len(filenames_to_delete)} temporary frame files")
+            for filename in filenames_to_delete:
+                filepath = os.path.join(self.image_folder_path, filename)
+                try:
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                        logger.debug(f"Deleted: {filename}")
+                    else:
+                        logger.debug(f"File not found for deletion: {filename}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete {filename}: {e}")
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
             
 
     def get_image_index_list(self) -> List[int]:
@@ -338,12 +476,16 @@ class FrameExtractor:
         """
         Get filenames that should be deleted (not in selected indices).
         
+        DEPRECATED: Use cleanup() method instead for automatic deletion.
+        This method is maintained for backward compatibility only.
+
         Returns:
             List[str]: Filenames to delete.
             
         Raises:
             Exception: If process_frames has not been called yet.
         """
+        logger.warning("get_filenames_to_delete() is deprecated; use cleanup() method instead")
         logger.debug("Getting filenames to delete")
         if not self.image_index_list:
             logger.error("Attempted to get filenames before process_frames() was called")
