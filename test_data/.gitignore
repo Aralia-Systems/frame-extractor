@@ -7,6 +7,10 @@
 *.wmv
 *.webm
 
+# Ignore generated frame files and histogram
+frame_*.png
+intensity_histogram.png
+
 # But keep this directory and its documentation
 !.gitkeep
 !README.md
