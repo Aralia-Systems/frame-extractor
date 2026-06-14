@@ -108,3 +108,24 @@ def video_with_output_dir(temp_video_dir, output_dir):
         raise e
     
     return video_path, output_dir
+
+
+@pytest.fixture
+def real_video_source_path():
+    """Return path to committed real test video in test_data/."""
+    source = Path(__file__).resolve().parent.parent / "test_data" / "input.mp4"
+    if not source.exists():
+        pytest.skip(f"Real test video not found: {source}")
+    return str(source)
+
+
+@pytest.fixture
+def real_video_with_output_dir(temp_video_dir, real_video_source_path):
+    """Copy real test video into an isolated temp output directory for integration tests."""
+    output_dir = os.path.join(temp_video_dir, "real_output")
+    os.makedirs(output_dir, exist_ok=True)
+
+    copied_video_path = os.path.join(output_dir, "input.mp4")
+    shutil.copy2(real_video_source_path, copied_video_path)
+
+    return copied_video_path, output_dir

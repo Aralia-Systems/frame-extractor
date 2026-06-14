@@ -1,0 +1,57 @@
+classDiagram
+    class FrameExtractor {
+        -input_video_path: str
+        -image_folder_path: str
+        -image_index_list: List[int]
+        -filenames: List[str]
+        -_extracted_filenames: List[str]
+        -mean_intensity: List[float]
+        -_processed: bool
+        -use_hw_acceleration: bool
+
+        +__init__(input_video_filepath: str, use_hw_acceleration: bool = True)
+        +__enter__()
+        +__exit__(exc_type, exc_val, exc_tb)
+        +process_frames() Tuple[float, float]
+        +cleanup() None
+        +get_image_index_list() List[int]
+        +get_filenames_to_process() List[str]
+
+        -_check_indices_in_range(reference_frame: int, image_range: Tuple[int, int]) List[int]
+        -detect_sync_errors_and_shift_frame_indices() None
+        -_plot_intensity_histogram() None
+    }
+
+    class OpenCV {
+        <<external>>
+        +imread(...)
+    }
+
+    class NumPy {
+        <<external>>
+        +mean(...)
+        +roll(...)
+    }
+
+    class SciPySignal {
+        <<external>>
+        +argrelextrema(...)
+    }
+
+    class MatplotlibPyplot {
+        <<external>>
+        +subplots(...)
+        +savefig(...)
+    }
+
+    class SubprocessFFmpeg {
+        <<external>>
+        +Popen(...)
+        +communicate(...)
+    }
+
+    FrameExtractor ..> OpenCV : reads frames
+    FrameExtractor ..> NumPy : intensity math
+    FrameExtractor ..> SciPySignal : local extrema
+    FrameExtractor ..> MatplotlibPyplot : histogram plot
+    FrameExtractor ..> SubprocessFFmpeg : frame extraction

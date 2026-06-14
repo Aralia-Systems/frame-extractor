@@ -27,6 +27,7 @@ MAX_IMAGES_LIMIT = 100
 REFERENCE_FRAME_OFFSET = 2
 FRAME_NAME_PREFIX = "frame_"
 FRAME_FILE_EXTENSION = ".png"
+FFMPEG_TIMEOUT_SECONDS = 120
 
 class FrameExtractor:
     """
@@ -86,6 +87,7 @@ class FrameExtractor:
         self.image_folder_path = os.path.dirname(input_video_filepath)
         self.image_index_list = []
         self.filenames = []
+        self._extracted_filenames = []
         self.mean_intensity = []
         self._processed = False
         self.use_hw_acceleration = use_hw_acceleration
@@ -140,8 +142,13 @@ class FrameExtractor:
         logger.info("Starting FFmpeg frame extraction...")
         start_time_extract = time.time()
         try:
+            # Snapshot existing frame files so stale files do not affect this run.
+            existing_frame_files = {
+                f for f in os.listdir(self.image_folder_path)
+                if f.endswith(FRAME_FILE_EXTENSION) and f.startswith(FRAME_NAME_PREFIX)
+            }
             process = subprocess.Popen(ffmpeg_cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-            stdout, stderr = process.communicate()
+            stdout, stderr = process.communicate(timeout=FFMPEG_TIMEOUT_SECONDS)
             exit_code = process.returncode
             
             if stdout:
@@ -155,6 +162,12 @@ class FrameExtractor:
                 raise Exception(f"FFmpeg frame extraction failed with exit code {exit_code}. Details: {stderr}")
             
             logger.info("FFmpeg frame extraction completed successfully")
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            logger.error(f"FFmpeg extraction timed out after {FFMPEG_TIMEOUT_SECONDS} seconds")
+            logger.error(f"Partial FFmpeg output. stdout: {stdout}, stderr: {stderr}")
+            raise Exception(f"FFmpeg frame extraction timed out after {FFMPEG_TIMEOUT_SECONDS} seconds")
         except Exception as e:
             logger.exception(f"Exception during FFmpeg extraction: {e}")
             raise
@@ -169,10 +182,20 @@ class FrameExtractor:
         logger.info("Starting frame identification and analysis...")
         start_time_identify = time.time()
         
-        # Get all frame files sorted by name
+        # Get newly extracted frame files sorted by name.
         all_files = sorted(os.listdir(self.image_folder_path))
-        frame_files = [f for f in all_files if f.endswith(FRAME_FILE_EXTENSION) and f.startswith(FRAME_NAME_PREFIX)]
+        frame_files = [
+            f for f in all_files
+            if f.endswith(FRAME_FILE_EXTENSION)
+            and f.startswith(FRAME_NAME_PREFIX)
+            and f not in existing_frame_files
+        ]
         logger.info(f"Found {len(frame_files)} frame files to process")
+        self._extracted_filenames = list(frame_files)
+
+        if not frame_files:
+            logger.error("No frames were extracted by FFmpeg")
+            raise Exception("Frame extraction produced no frames.")
         
         if len(frame_files) > MAX_IMAGES_LIMIT:
             logger.error(f"Too many frames found ({len(frame_files)}) - FFmpeg extraction may have failed")
@@ -228,7 +251,7 @@ class FrameExtractor:
         # Select reference frame based on detected cycles
         # Typically there are 5 cycles in a 2-second video; EV converges at the second cycle
         logger.info(f"Selecting reference frame from {len(maximal_diff2)} detected cycles...")
-        if len(maximal_diff2) >= REFERENCE_FRAME_OFFSET:
+        if len(maximal_diff2) > REFERENCE_FRAME_OFFSET:
             current_value = maximal_diff2[REFERENCE_FRAME_OFFSET]
             logger.info(f"Selected frame index {current_value} as reference (cycle {REFERENCE_FRAME_OFFSET})")
         elif len(maximal_diff2) == 1:
@@ -276,13 +299,13 @@ class FrameExtractor:
         masked_list = [x + reference_frame for x in FRAME_INDEX_MASK]
         logger.debug(f"Masked indices: {masked_list}")
         
-        all_in_range = all(start_idx >= image_range[0] and start_idx <= image_range[1] for start_idx in masked_list)
+        all_in_range = all(start_idx >= image_range[0] and start_idx < image_range[1] for start_idx in masked_list)
 
         if all_in_range:
             logger.info(f"All indices within valid range {image_range}: {masked_list}")
             return masked_list
         else:
-            out_of_range = [idx for idx in masked_list if idx < image_range[0] or idx > image_range[1]]
+            out_of_range = [idx for idx in masked_list if idx < image_range[0] or idx >= image_range[1]]
             logger.error(f"Frame indices out of bounds. Invalid indices: {out_of_range}, valid range: {image_range}")
             raise Exception(f"Frame indices out of bounds: {out_of_range} not in range {image_range}")
 
@@ -406,15 +429,19 @@ class FrameExtractor:
         This method is automatically called when using FrameExtractor as a context manager.
         Should be called manually if not using context manager pattern.
         """
-        if not self._processed:
+        if not self._processed and not self._extracted_filenames:
             logger.debug("Cleanup called before processing; nothing to clean")
             return
         
         try:
-            filenames_to_delete = [
-                self.filenames[x] for x in range(len(self.filenames)) 
-                if x not in self.image_index_list
-            ]
+            if self._processed:
+                filenames_to_delete = [
+                    self.filenames[x] for x in range(len(self.filenames))
+                    if x not in self.image_index_list
+                ]
+            else:
+                # If processing failed partway through, remove only files created in this run.
+                filenames_to_delete = list(self._extracted_filenames)
             
             if not filenames_to_delete:
                 logger.info("No files to delete; all frames were selected")
@@ -431,6 +458,7 @@ class FrameExtractor:
                         logger.debug(f"File not found for deletion: {filename}")
                 except Exception as e:
                     logger.warning(f"Failed to delete {filename}: {e}")
+            self._extracted_filenames = []
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
             
@@ -471,28 +499,3 @@ class FrameExtractor:
         filenames_to_process = [self.filenames[x] for x in self.image_index_list]
         logger.info(f"Returning {len(filenames_to_process)} filenames to process: {filenames_to_process}")
         return filenames_to_process
-    
-    def get_filenames_to_delete(self) -> List[str]:
-        """
-        Get filenames that should be deleted (not in selected indices).
-        
-        DEPRECATED: Use cleanup() method instead for automatic deletion.
-        This method is maintained for backward compatibility only.
-
-        Returns:
-            List[str]: Filenames to delete.
-            
-        Raises:
-            Exception: If process_frames has not been called yet.
-        """
-        logger.warning("get_filenames_to_delete() is deprecated; use cleanup() method instead")
-        logger.debug("Getting filenames to delete")
-        if not self.image_index_list:
-            logger.error("Attempted to get filenames before process_frames() was called")
-            raise Exception("image_index_list is empty. Call process_frames() first.")
-        if not self.filenames:
-            logger.error("Filenames list is empty")
-            raise Exception("filenames list is empty. Call process_frames() first.")
-        filenames_to_delete = [self.filenames[x] for x in range(len(self.filenames)) if x not in self.image_index_list]
-        logger.info(f"Returning {len(filenames_to_delete)} filenames to delete: {filenames_to_delete}")
-        return filenames_to_delete

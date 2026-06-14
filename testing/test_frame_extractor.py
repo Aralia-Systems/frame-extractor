@@ -4,9 +4,11 @@ Unit and integration tests for FrameExtractor class.
 
 import pytest
 import os
-import logging
+import subprocess
+import numpy as np
 from pathlib import Path
 from frame_extractor import FrameExtractor
+import frame_extractor.frame_extractor as extractor_module
 
 
 class TestFrameExtractorInitialization:
@@ -215,19 +217,24 @@ class TestFrameExtractorGetters:
         expected = ["frame_0001.png", "frame_0003.png", "frame_0005.png"]
         assert result == expected
     
-    def test_get_filenames_to_delete_deprecated_warning(self, caplog, video_with_output_dir):
-        """Test that deprecated method logs warning."""
-        video_path, _ = video_with_output_dir
+    def test_cleanup_behavior_replaces_deleted_filenames_api(self, video_with_output_dir):
+        """Test cleanup performs delete-selection behavior directly."""
+        video_path, output_dir = video_with_output_dir
         extractor = FrameExtractor(video_path)
-        
+
         extractor.filenames = ["frame_0001.png", "frame_0002.png"]
         extractor.image_index_list = [0]
-        
-        with caplog.at_level(logging.WARNING):
-            result = extractor.get_filenames_to_delete()
-        
-        assert "deprecated" in caplog.text.lower()
-        assert result == ["frame_0002.png"]
+        extractor._processed = True
+
+        keep_path = os.path.join(output_dir, "frame_0001.png")
+        delete_path = os.path.join(output_dir, "frame_0002.png")
+        open(keep_path, 'w').close()
+        open(delete_path, 'w').close()
+
+        extractor.cleanup()
+
+        assert os.path.exists(keep_path)
+        assert not os.path.exists(delete_path)
 
 
 class TestFrameExtractorIntegration:
@@ -372,3 +379,122 @@ class TestFrameExtractorEdgeCases:
         
         with pytest.raises(Exception, match="filenames list is empty"):
             extractor.get_filenames_to_process()
+
+
+class TestFrameExtractorFailureModes:
+    """Regression tests for failure-path handling and edge cases."""
+
+    class _SuccessPopen:
+        def __init__(self, *_args, **_kwargs):
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return "", ""
+
+    class _TimeoutPopen:
+        def __init__(self, *_args, **_kwargs):
+            self.returncode = None
+            self._killed = False
+
+        def communicate(self, timeout=None):
+            if self._killed:
+                return "", "timed out"
+            raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=timeout or 0)
+
+        def kill(self):
+            self._killed = True
+
+    def test_check_indices_upper_bound_is_exclusive(self, video_with_output_dir):
+        """Upper bound should be exclusive to prevent out-of-range list access."""
+        video_path, _ = video_with_output_dir
+        extractor = FrameExtractor(video_path)
+
+        with pytest.raises(Exception, match="Frame indices out of bounds"):
+            extractor._check_indices_in_range(reference_frame=10, image_range=(0, 20))
+
+    def test_process_frames_handles_ffmpeg_timeout(self, video_with_output_dir, monkeypatch):
+        """FFmpeg hangs should raise a clear timeout exception."""
+        video_path, output_dir = video_with_output_dir
+        extractor = FrameExtractor(video_path)
+
+        monkeypatch.setattr(extractor_module.subprocess, "Popen", self._TimeoutPopen)
+        monkeypatch.setattr(extractor_module.os, "listdir", lambda _path: [])
+
+        with pytest.raises(Exception, match="timed out"):
+            extractor.process_frames()
+
+    def test_cleanup_removes_partial_extraction_on_failure(self, video_with_output_dir):
+        """Cleanup should remove files extracted during a failed run."""
+        video_path, output_dir = video_with_output_dir
+        extractor = FrameExtractor(video_path)
+
+        partial = "frame_9999.png"
+        partial_path = os.path.join(output_dir, partial)
+        open(partial_path, "w").close()
+
+        extractor._processed = False
+        extractor._extracted_filenames = [partial]
+
+        extractor.cleanup()
+
+        assert not os.path.exists(partial_path)
+        assert extractor._extracted_filenames == []
+
+    def test_process_frames_two_extrema_raises_clear_error(self, video_with_output_dir, monkeypatch):
+        """Exactly two detected extrema should raise the insufficent-cycles error, not IndexError."""
+        video_path, _ = video_with_output_dir
+        extractor = FrameExtractor(video_path)
+
+        old_files = ["frame_0001.png", "frame_0002.png"]
+        new_files = [f"frame_{i:04d}.png" for i in range(3, 43)]
+        call_count = {"value": 0}
+
+        def fake_listdir(_path):
+            call_count["value"] += 1
+            if call_count["value"] == 1:
+                return old_files
+            return old_files + new_files
+
+        monkeypatch.setattr(extractor_module.subprocess, "Popen", self._SuccessPopen)
+        monkeypatch.setattr(extractor_module.os, "listdir", fake_listdir)
+        monkeypatch.setattr(extractor_module.cv2, "imread", lambda *_args, **_kwargs: np.full((4, 4), 100, dtype=np.uint8))
+        monkeypatch.setattr(extractor_module, "argrelextrema", lambda *_args, **_kwargs: (np.array([10, 20]),))
+        monkeypatch.setattr(extractor, "detect_sync_errors_and_shift_frame_indices", lambda: None)
+        monkeypatch.setattr(extractor, "_plot_intensity_histogram", lambda: None)
+
+        with pytest.raises(Exception, match="insufficient cycles"):
+            extractor.process_frames()
+
+
+@pytest.mark.integration
+@pytest.mark.realdata
+class TestFrameExtractorRealData:
+    """Integration tests using committed real video data from test_data/."""
+
+    def test_process_frames_on_real_video(self, real_video_with_output_dir):
+        """Process committed real video and validate core outputs."""
+        video_path, output_dir = real_video_with_output_dir
+        extractor = FrameExtractor(video_path, use_hw_acceleration=False)
+
+        extract_time, identify_time = extractor.process_frames()
+
+        assert extract_time > 0
+        assert identify_time > 0
+        assert len(extractor.filenames) > 0
+        assert len(extractor.image_index_list) > 0
+
+        histogram_path = os.path.join(output_dir, "intensity_histogram.png")
+        assert os.path.exists(histogram_path)
+        assert os.path.getsize(histogram_path) > 0
+
+    def test_context_cleanup_on_real_video(self, real_video_with_output_dir):
+        """Context manager should leave only selected frames after cleanup."""
+        video_path, output_dir = real_video_with_output_dir
+
+        with FrameExtractor(video_path, use_hw_acceleration=False) as extractor:
+            extractor.process_frames()
+            selected = extractor.get_filenames_to_process()
+            assert len(selected) > 0
+
+        remaining_frames = [f for f in os.listdir(output_dir) if f.startswith("frame_") and f.endswith(".png")]
+        assert len(remaining_frames) == len(selected)
