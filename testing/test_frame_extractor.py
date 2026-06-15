@@ -459,7 +459,7 @@ class TestFrameExtractorFailureModes:
         monkeypatch.setattr(extractor_module.os, "listdir", fake_listdir)
         monkeypatch.setattr(extractor_module.cv2, "imread", lambda *_args, **_kwargs: np.full((4, 4), 100, dtype=np.uint8))
         monkeypatch.setattr(extractor_module, "argrelextrema", lambda *_args, **_kwargs: (np.array([10, 20]),))
-        monkeypatch.setattr(extractor, "detect_sync_errors_and_shift_frame_indices", lambda: None)
+        monkeypatch.setattr(extractor, "_detect_sync_errors_and_shift_frame_indices", lambda: None)
         monkeypatch.setattr(extractor, "_plot_intensity_histogram", lambda: None)
 
         with pytest.raises(Exception, match="insufficient cycles"):
